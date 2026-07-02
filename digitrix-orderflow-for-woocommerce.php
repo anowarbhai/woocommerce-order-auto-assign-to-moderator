@@ -32,6 +32,11 @@ function aoam_is_post_request() {
  return 'POST' === $request_method;
 }
 
+function aoam_is_remote_import_running() {
+ global $aoam_doing_import_depth;
+ return !empty($aoam_doing_import_depth);
+}
+
 // Check if WooCommerce is active
 if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get_option('active_plugins')))) {
  add_action('admin_notices', 'aoam_woocommerce_missing_notice');
@@ -795,9 +800,16 @@ function aoam_remote_order_import_page() {
 }
 
 function aoam_import_remote_orders($source_settings = null) {
-  global $aoam_doing_import_depth;
+  global $aoam_doing_import_depth, $wpdb;
   if (!isset($aoam_doing_import_depth)) {
     $aoam_doing_import_depth = 0;
+  }
+  $is_root_import = ($source_settings === null);
+  if ($is_root_import) {
+    if (get_transient('aoam_remote_order_import_lock')) {
+      return new WP_Error('aoam_remote_import_locked', 'Remote order import is already running.');
+    }
+    set_transient('aoam_remote_order_import_lock', time(), 10 * MINUTE_IN_SECONDS);
   }
   $aoam_doing_import_depth++;
 
@@ -833,11 +845,13 @@ function aoam_import_remote_orders($source_settings = null) {
     
     $result = array('imported' => 0, 'skipped' => 0, 'failed' => 0);
     $page = 1;
-    $per_page = max(1, min(100, absint($settings['per_page'] ?? 20)));
-    $max_pages = 20; // Process up to 20 pages (max 2000 orders) per source to prevent timeouts
+    $per_run_limit = max(1, min(100, absint($settings['per_page'] ?? 20)));
+    $per_page = $per_run_limit;
+    $max_pages = 1;
     $keep_fetching = true;
+    $processed_total = 0;
 
-    while ($keep_fetching && $page <= $max_pages) {
+    while ($keep_fetching && $page <= $max_pages && $processed_total < $per_run_limit) {
       if (php_sapi_name() === 'cli') {
         echo "  -> Fetching Page {$page}... URL: " . esc_url($endpoint) . " (Limit: {$per_page})\n";
       }
@@ -893,6 +907,10 @@ function aoam_import_remote_orders($source_settings = null) {
       $skipped_in_page = 0;
 
       foreach ($orders as $remote_order) {
+        if ($processed_total >= $per_run_limit) {
+          break;
+        }
+        $processed_total++;
         if (empty($remote_order['id'])) {
           $result['failed']++;
           continue;
@@ -927,6 +945,12 @@ function aoam_import_remote_orders($source_settings = null) {
     return $result;
   } finally {
     $aoam_doing_import_depth--;
+    if ($is_root_import) {
+      delete_transient('aoam_remote_order_import_lock');
+    }
+    if (isset($wpdb) && is_object($wpdb) && method_exists($wpdb, 'check_connection')) {
+      $wpdb->check_connection(false);
+    }
   }
 }
 
@@ -986,11 +1010,12 @@ function aoam_create_order_from_remote_order($remote_order, $source_url) {
 
  $order->calculate_totals();
  $status = sanitize_key($remote_order['status'] ?? 'processing');
- $order->update_status($status, 'Imported from remote WooCommerce order #' . $remote_id . '.');
+ $order->set_status($status);
  $order->update_meta_data('_aoam_remote_order_id', $remote_id);
  $order->update_meta_data('_aoam_remote_order_source', esc_url_raw($source_url));
  $order->update_meta_data('_aoam_remote_order_key', $source_key . ':' . $remote_id);
  $order->save();
+ $order->add_order_note('Imported from remote WooCommerce order #' . $remote_id . '.');
 
  assign_order_to_specific_moderator($order->get_id(), $order, false);
  return $order->get_id();
@@ -1029,6 +1054,9 @@ function aoam_add_remote_line_item_to_order($order, $line_item) {
 
 add_action('woocommerce_order_status_changed', 'aoam_sync_imported_order_status_to_remote', 20, 4);
 function aoam_sync_imported_order_status_to_remote($order_id, $from_status, $to_status, $order) {
+ if (aoam_is_remote_import_running()) {
+ return;
+ }
  if (!$order || !is_a($order, 'WC_Order')) {
  return;
  }
